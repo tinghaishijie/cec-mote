@@ -12,6 +12,6 @@ The plugin does not talk to the CEC adapter directly. It uses `cecd` as the sole
 
 ## Skip TV wake on Wake-on-LAN (streaming)
 
-Once CEC sleep/wake is installed, the TV normally turns on every time the PC resumes. When the PC is woken over Wake-on-LAN (e.g. a Moonlight/Sunshine stream), `cec-mote` skips the CEC TV wake instead — it compares each network interface's kernel `wakeup_count` across the suspend, and if a NIC counter increased the resume was a network wake. Local wakes (Bluetooth, keyboard) still turn the TV on. Toggle it from the **CEC Sleep / Wake** section ("Skip TV wake when streaming").
+Once CEC sleep/wake is installed, the TV normally turns on every time the PC resumes. When the PC is woken over Wake-on-LAN for a headless Moonlight/Sunshine stream, `cec-mote` skips the CEC TV wake instead. It decides by checking, right after resume, whether a real game controller is connected (a joystick device that is not Steam Input's virtual one): a controller means someone is at the console → turn the TV on; a streaming wake has none → skip. Toggle it from the **CEC Sleep / Wake** section ("Skip TV wake when streaming").
 
-> **Prerequisite:** your NIC must report the wake in sysfs — i.e. `wakeup_count` must actually increase on a WoL resume. This is driver-dependent; if it does not on your hardware, turn the toggle off.
+> **Prerequisite:** you wake locally with a game controller. A wake with no controller connected (e.g. power button only) is treated as a streaming wake and leaves the TV off, and a controller left connected while you stream counts as local — turn controllers off when away, or flip the toggle.

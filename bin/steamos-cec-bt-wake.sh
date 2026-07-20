@@ -480,36 +480,14 @@ ACTIVE_SOURCE="\${2:-}"
 CEC_DEST="$CEC_DEST"
 CEC_OBJECT_PATH="$CEC_OBJECT_PATH"
 CEC_INTERFACE="$CEC_INTERFACE"
-SNAPSHOT_DIR="\${XDG_RUNTIME_DIR:-/tmp}/steamos-cec-bt-wake"
-SNAPSHOT_FILE="\$SNAPSHOT_DIR/wake-source.snapshot"
 POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
+CONTROLLER_WAIT_SECONDS=10
 
 log()  { printf 'cec-control: %s\n' "\$*" >&2; }
 warn() { printf 'cec-control: %s\n' "\$*" >&2; }
 
-# Record every network device's kernel wakeup counter just before suspend so the
-# resume side can tell whether a Wake-on-LAN magic packet (i.e. a Moonlight
-# stream) was the wake source.
-snapshot_network_wakeup_counts() {
-  local dev iface count
-  mkdir -p "\$SNAPSHOT_DIR" 2>/dev/null || true
-  if ! : > "\$SNAPSHOT_FILE" 2>/dev/null; then
-    warn "Could not write wake-source snapshot to \$SNAPSHOT_FILE"
-    return 0
-  fi
-  for dev in /sys/class/net/*/device/power/wakeup_count; do
-    [[ -r "\$dev" ]] || continue
-    iface="\${dev#/sys/class/net/}"
-    iface="\${iface%%/*}"
-    [[ "\$iface" == "lo" ]] && continue
-    count="\$(cat "\$dev" 2>/dev/null || true)"
-    [[ "\$count" =~ ^[0-9]+\$ ]] || continue
-    printf '%s %s\n' "\$iface" "\$count" >> "\$SNAPSHOT_FILE"
-  done
-}
-
-# The skip-on-network-wake behavior is on by default; the policy file only exists
-# to let the user turn it off without reinstalling.
+# The gate is on by default; the policy file only exists to let the user turn it
+# off from the plugin UI without reinstalling.
 skip_cec_wake_on_network() {
   local value=1 line
   if [[ -r "\$POLICY_FILE" ]]; then
@@ -519,22 +497,46 @@ skip_cec_wake_on_network() {
   [[ "\$value" == "1" || "\${value,,}" == "true" ]]
 }
 
-# Returns success (and logs) when a network interface signaled a wakeup event
-# across the suspend, compared against the pre-suspend snapshot.
-network_wake_detected() {
-  [[ -r "\$SNAPSHOT_FILE" ]] || return 1
-  local iface old dev current
-  while read -r iface old; do
-    [[ -n "\$iface" && "\$old" =~ ^[0-9]+\$ ]] || continue
-    dev="/sys/class/net/\$iface/device/power/wakeup_count"
-    [[ -r "\$dev" ]] || continue
-    current="\$(cat "\$dev" 2>/dev/null || true)"
-    [[ "\$current" =~ ^[0-9]+\$ ]] || continue
-    if (( current > old )); then
-      log "Network (WoL) wake detected on \$iface (\$old->\$current); skipping CEC TV wake"
+# A physically connected game controller shows up as a joystick node whose
+# backing device is a real USB/Bluetooth device. Steam Input keeps a *virtual*
+# joystick around at all times (under /sys/devices/virtual), and keyboards/mice
+# never create a joystick node, so requiring a non-virtual js* cleanly means "a
+# real controller is connected" (a local wake). A headless Wake-on-LAN /
+# Moonlight wake has none. A controller battery under /sys/class/power_supply is
+# a secondary signal for the rare pad that exposes one without a js node.
+local_controller_connected() {
+  local js target entry name
+  for js in /sys/class/input/js*; do
+    [[ -e "\$js" ]] || continue
+    target="\$(readlink -f "\$js/device" 2>/dev/null || true)"
+    [[ -n "\$target" ]] || continue
+    case "\$target" in
+      */devices/virtual/*) continue ;;
+      *) return 0 ;;
+    esac
+  done
+  for entry in /sys/class/power_supply/*; do
+    [[ -e "\$entry" ]] || continue
+    name="\${entry##*/}"
+    case "\$name" in
+      *controller*|*gamepad*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Poll for a connected controller for a bounded window: a local wake reconnects
+# one within a second or two (we return as soon as it appears), while a streaming
+# wake never does (we wait out the window, then report absent).
+wait_for_local_controller() {
+  local ticks=0 limit=\$((CONTROLLER_WAIT_SECONDS * 2))
+  while (( ticks < limit )); do
+    if local_controller_connected; then
       return 0
     fi
-  done < "\$SNAPSHOT_FILE"
+    sleep 0.5
+    ticks=\$((ticks + 1))
+  done
   return 1
 }
 
@@ -592,7 +594,6 @@ main() {
 
   case "\$ACTION" in
     standby)
-      snapshot_network_wakeup_counts
       sleep 2
       call_cec Standby 0 || warn "Standby command failed"
       ;;
@@ -601,7 +602,8 @@ main() {
         warn "Wake requested without an active-source argument"
         exit 0
       fi
-      if skip_cec_wake_on_network && network_wake_detected; then
+      if skip_cec_wake_on_network && ! wait_for_local_controller; then
+        log "No game controller connected after wake; treating as a network/streaming wake, skipping CEC TV wake"
         exit 0
       fi
       sleep 3
