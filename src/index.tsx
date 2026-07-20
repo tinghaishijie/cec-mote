@@ -4,6 +4,7 @@ import {
   PanelSection,
   PanelSectionRow,
   Spinner,
+  ToggleField,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
@@ -58,6 +59,16 @@ interface SetupStatus {
   returncode: number;
 }
 
+interface CecWakePolicy {
+  skipOnNetworkWake: boolean;
+}
+
+interface CecWakePolicyResult {
+  ok: boolean;
+  skipOnNetworkWake: boolean;
+  error: string | null;
+}
+
 const getStatus = callable<[], CecStatus>("get_status");
 const volumeUp = callable<[], CecActionResult>("volume_up");
 const volumeDown = callable<[], CecActionResult>("volume_down");
@@ -68,6 +79,8 @@ const uninstallCecSetup = callable<[], SetupStatus>("uninstall_cec_setup");
 const getBluetoothSetupStatus = callable<[], SetupStatus>("get_bluetooth_setup_status");
 const installBluetoothSetup = callable<[], SetupStatus>("install_bluetooth_setup");
 const uninstallBluetoothSetup = callable<[], SetupStatus>("uninstall_bluetooth_setup");
+const getCecWakePolicy = callable<[], CecWakePolicy>("get_cec_wake_policy");
+const setCecWakePolicy = callable<[boolean], CecWakePolicyResult>("set_cec_wake_policy");
 
 const ACTIONS: Record<ActionName, () => Promise<CecActionResult>> = {
   volume_up: volumeUp,
@@ -181,6 +194,7 @@ function SetupSection({
   onInstall,
   onRefresh,
   onUninstall,
+  wakePolicy,
 }: {
   title: string;
   status: SetupStatus | null;
@@ -189,6 +203,11 @@ function SetupSection({
   onInstall: () => void;
   onRefresh: () => void;
   onUninstall: () => void;
+  wakePolicy?: {
+    checked: boolean;
+    disabled: boolean;
+    onChange: (value: boolean) => void;
+  };
 }) {
   const statusLabel = loading
     ? `Checking ${title.toLowerCase()}...`
@@ -255,6 +274,18 @@ function SetupSection({
         </PanelSectionRow>
       ))}
 
+      {wakePolicy ? (
+        <PanelSectionRow>
+          <ToggleField
+            label="Skip TV wake when streaming"
+            description="Don't turn on the TV when the PC is woken over the network (Wake-on-LAN / Moonlight)."
+            checked={wakePolicy.checked}
+            disabled={wakePolicy.disabled}
+            onChange={wakePolicy.onChange}
+          />
+        </PanelSectionRow>
+      ) : null}
+
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={pending !== null} onClick={onInstall}>
           {pending === "install" ? "Working..." : setupPrimaryActionLabel(status)}
@@ -298,6 +329,8 @@ function Content() {
     cec: null,
     bluetooth: null,
   });
+  const [wakePolicy, setWakePolicy] = useState(true);
+  const [wakePolicyPending, setWakePolicyPending] = useState(false);
 
   const loadStatus = async () => {
     setStatusLoading(true);
@@ -340,10 +373,47 @@ function Content() {
     }
   };
 
+  const loadWakePolicy = async () => {
+    try {
+      const result = await withTimeout(getCecWakePolicy(), "Timed out while reading wake policy");
+      setWakePolicy(result.skipOnNetworkWake);
+    } catch (error) {
+      console.error("Failed to load CEC wake policy", error);
+    }
+  };
+
+  const handleWakePolicyChange = async (value: boolean) => {
+    setWakePolicyPending(true);
+    setWakePolicy(value);
+    try {
+      const result = await withTimeout(
+        setCecWakePolicy(value),
+        "Timed out while updating wake policy",
+      );
+      setWakePolicy(result.skipOnNetworkWake);
+      if (!result.ok) {
+        toaster.toast({
+          title: "cec-mote",
+          body: result.error ?? "Unable to update wake policy",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to update CEC wake policy", error);
+      toaster.toast({
+        title: "cec-mote",
+        body: "Unable to update wake policy",
+      });
+      await loadWakePolicy();
+    } finally {
+      setWakePolicyPending(false);
+    }
+  };
+
   useEffect(() => {
     void loadStatus();
     void loadSetupStatus("cec");
     void loadSetupStatus("bluetooth");
+    void loadWakePolicy();
   }, []);
 
   const handleAction = async (action: ActionName) => {
@@ -446,6 +516,15 @@ function Content() {
         onInstall={() => void handleSetupAction("cec", "install")}
         onRefresh={() => void loadSetupStatus("cec")}
         onUninstall={() => void handleSetupAction("cec", "uninstall")}
+        wakePolicy={
+          setupStatus.cec?.state === "configured"
+            ? {
+                checked: wakePolicy,
+                disabled: wakePolicyPending,
+                onChange: (value) => void handleWakePolicyChange(value),
+              }
+            : undefined
+        }
       />
 
       <SetupSection

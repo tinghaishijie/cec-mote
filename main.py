@@ -24,6 +24,9 @@ DISCOVERY_POLL_SECONDS = 2.0
 DISCOVERY_POLL_INTERVAL_SECONDS = 0.2
 SETUP_COMMAND_TIMEOUT_SECONDS = 90.0
 SETUP_SCRIPT_RELATIVE_PATH = os.path.join("bin", "steamos-cec-bt-wake.sh")
+VAR_LIB_DIR = "/var/lib/steamos-cec-bt-wake"
+CEC_WAKE_POLICY_FILE = os.path.join(VAR_LIB_DIR, "cec-wake-policy.conf")
+CEC_WAKE_POLICY_KEY = "SKIP_CEC_WAKE_ON_NETWORK"
 
 
 class SessionContext:
@@ -140,6 +143,18 @@ class Plugin:
 
     async def uninstall_bluetooth_setup(self) -> dict:
         return await self._run_setup_mode("uninstall", "bluetooth")
+
+    async def get_cec_wake_policy(self) -> dict:
+        return {"skipOnNetworkWake": self._read_cec_wake_policy()}
+
+    async def set_cec_wake_policy(self, skip_on_network: bool) -> dict:
+        value = bool(skip_on_network)
+        try:
+            self._write_cec_wake_policy(value)
+        except OSError as exc:
+            decky.logger.error("Failed to write CEC wake policy: %s", exc)
+            return {"ok": False, "skipOnNetworkWake": value, "error": str(exc)}
+        return {"ok": True, "skipOnNetworkWake": value, "error": None}
 
     def _ensure_action_lock(self) -> asyncio.Lock:
         if self._action_lock is None:
@@ -491,6 +506,43 @@ class Plugin:
         env = self._sanitized_env()
         env.setdefault("LC_ALL", "C")
         return env
+
+    @staticmethod
+    def _read_cec_wake_policy() -> bool:
+        # Default (missing file) mirrors the setup script: skip TV wake on a
+        # network/WoL resume is enabled unless explicitly turned off.
+        try:
+            with open(CEC_WAKE_POLICY_FILE, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            decky.logger.warning("Could not read CEC wake policy: %s", exc)
+            return True
+
+        value = True
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(f"{CEC_WAKE_POLICY_KEY}="):
+                raw = stripped.split("=", 1)[1].strip().lower()
+                if raw:
+                    value = raw in {"1", "true"}
+        return value
+
+    @staticmethod
+    def _write_cec_wake_policy(skip_on_network: bool) -> None:
+        os.makedirs(VAR_LIB_DIR, exist_ok=True)
+        body = (
+            "# Skip the CEC TV wake when the resume was triggered by the network "
+            "(Wake-on-LAN),\n"
+            "# e.g. a Moonlight stream. Set to 0 to always wake the TV on resume.\n"
+            f"{CEC_WAKE_POLICY_KEY}={'1' if skip_on_network else '0'}\n"
+        )
+        tmp_path = f"{CEC_WAKE_POLICY_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, CEC_WAKE_POLICY_FILE)
 
     @staticmethod
     def _sanitized_env() -> dict[str, str]:

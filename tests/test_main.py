@@ -178,6 +178,66 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(script_path.endswith("bin/steamos-cec-bt-wake.sh"))
         self.assertTrue(os.path.exists(script_path))
 
+    def _use_temp_policy(self) -> str:
+        tmpdir = tempfile.TemporaryDirectory(prefix="cec-mote-policy-")
+        self.addCleanup(tmpdir.cleanup)
+        policy = os.path.join(tmpdir.name, "cec-wake-policy.conf")
+        for target, value in (
+            ("VAR_LIB_DIR", tmpdir.name),
+            ("CEC_WAKE_POLICY_FILE", policy),
+        ):
+            patcher = patch.object(mote_main, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return policy
+
+    async def test_get_cec_wake_policy_defaults_enabled(self):
+        self._use_temp_policy()
+        result = await self.plugin.get_cec_wake_policy()
+        self.assertEqual(result, {"skipOnNetworkWake": True})
+
+    async def test_set_cec_wake_policy_roundtrip(self):
+        policy = self._use_temp_policy()
+
+        disabled = await self.plugin.set_cec_wake_policy(False)
+        self.assertTrue(disabled["ok"])
+        self.assertFalse(disabled["skipOnNetworkWake"])
+        with open(policy, encoding="utf-8") as handle:
+            self.assertIn("SKIP_CEC_WAKE_ON_NETWORK=0", handle.read())
+        self.assertEqual(
+            await self.plugin.get_cec_wake_policy(),
+            {"skipOnNetworkWake": False},
+        )
+
+        enabled = await self.plugin.set_cec_wake_policy(True)
+        self.assertTrue(enabled["skipOnNetworkWake"])
+        with open(policy, encoding="utf-8") as handle:
+            self.assertIn("SKIP_CEC_WAKE_ON_NETWORK=1", handle.read())
+        self.assertEqual(
+            await self.plugin.get_cec_wake_policy(),
+            {"skipOnNetworkWake": True},
+        )
+
+    async def test_get_cec_wake_policy_reads_disabled_value(self):
+        policy = self._use_temp_policy()
+        with open(policy, "w", encoding="utf-8") as handle:
+            handle.write("SKIP_CEC_WAKE_ON_NETWORK=0\n")
+        self.assertEqual(
+            await self.plugin.get_cec_wake_policy(),
+            {"skipOnNetworkWake": False},
+        )
+
+    async def test_set_cec_wake_policy_reports_write_failure(self):
+        self._use_temp_policy()
+        with patch.object(
+            mote_main.Plugin,
+            "_write_cec_wake_policy",
+            Mock(side_effect=OSError("boom")),
+        ):
+            result = await self.plugin.set_cec_wake_policy(True)
+        self.assertFalse(result["ok"])
+        self.assertIn("boom", result["error"])
+
     async def test_volume_up_maps_to_volume_up_method(self):
         await self._assert_action_mapping("volume_up", "VolumeUp")
 

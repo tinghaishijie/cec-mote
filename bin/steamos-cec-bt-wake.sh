@@ -16,6 +16,7 @@ VAR_LIB_DIR="/var/lib/steamos-cec-bt-wake"
 LEGACY_HELPER_DIR="/etc/steamos-cec-bt-wake"
 CEC_STATE_FILE="$VAR_LIB_DIR/cec-state.conf"
 BT_STATE_FILE="$VAR_LIB_DIR/bluetooth-state.conf"
+CEC_WAKE_POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
 STATE_FILE="$VAR_LIB_DIR/state.conf"
 LEGACY_STATE_FILE="/etc/steamos-cec-bt-wake.conf"
 CEC_SLEEP_SERVICE="/etc/systemd/system/cec-sleep.service"
@@ -457,6 +458,18 @@ install_cec_helper() {
   generate_cec_helper_content | write_file "$CEC_HELPER" 0755
 }
 
+# Seed the wake-policy file with the default (skip TV wake on network/WoL resume)
+# only when it does not already exist, so a reinstall never overwrites a choice
+# the user made from the plugin UI.
+ensure_cec_wake_policy_default() {
+  [[ -e "$CEC_WAKE_POLICY_FILE" ]] && return 0
+  cat <<EOF2 | write_file "$CEC_WAKE_POLICY_FILE" 0644
+# Skip the CEC TV wake when the resume was triggered by the network (Wake-on-LAN),
+# e.g. a Moonlight stream. Set to 0 to always wake the TV on resume.
+SKIP_CEC_WAKE_ON_NETWORK=1
+EOF2
+}
+
 generate_cec_helper_content() {
   cat <<EOF2
 #!/usr/bin/env bash
@@ -467,9 +480,63 @@ ACTIVE_SOURCE="\${2:-}"
 CEC_DEST="$CEC_DEST"
 CEC_OBJECT_PATH="$CEC_OBJECT_PATH"
 CEC_INTERFACE="$CEC_INTERFACE"
+SNAPSHOT_DIR="\${XDG_RUNTIME_DIR:-/tmp}/steamos-cec-bt-wake"
+SNAPSHOT_FILE="\$SNAPSHOT_DIR/wake-source.snapshot"
+POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
 
 log()  { printf 'cec-control: %s\n' "\$*" >&2; }
 warn() { printf 'cec-control: %s\n' "\$*" >&2; }
+
+# Record every network device's kernel wakeup counter just before suspend so the
+# resume side can tell whether a Wake-on-LAN magic packet (i.e. a Moonlight
+# stream) was the wake source.
+snapshot_network_wakeup_counts() {
+  local dev iface count
+  mkdir -p "\$SNAPSHOT_DIR" 2>/dev/null || true
+  if ! : > "\$SNAPSHOT_FILE" 2>/dev/null; then
+    warn "Could not write wake-source snapshot to \$SNAPSHOT_FILE"
+    return 0
+  fi
+  for dev in /sys/class/net/*/device/power/wakeup_count; do
+    [[ -r "\$dev" ]] || continue
+    iface="\${dev#/sys/class/net/}"
+    iface="\${iface%%/*}"
+    [[ "\$iface" == "lo" ]] && continue
+    count="\$(cat "\$dev" 2>/dev/null || true)"
+    [[ "\$count" =~ ^[0-9]+\$ ]] || continue
+    printf '%s %s\n' "\$iface" "\$count" >> "\$SNAPSHOT_FILE"
+  done
+}
+
+# The skip-on-network-wake behavior is on by default; the policy file only exists
+# to let the user turn it off without reinstalling.
+skip_cec_wake_on_network() {
+  local value=1 line
+  if [[ -r "\$POLICY_FILE" ]]; then
+    line="\$(sed -n 's/^SKIP_CEC_WAKE_ON_NETWORK=//p' "\$POLICY_FILE" | tail -n1)"
+    [[ -n "\$line" ]] && value="\$line"
+  fi
+  [[ "\$value" == "1" || "\${value,,}" == "true" ]]
+}
+
+# Returns success (and logs) when a network interface signaled a wakeup event
+# across the suspend, compared against the pre-suspend snapshot.
+network_wake_detected() {
+  [[ -r "\$SNAPSHOT_FILE" ]] || return 1
+  local iface old dev current
+  while read -r iface old; do
+    [[ -n "\$iface" && "\$old" =~ ^[0-9]+\$ ]] || continue
+    dev="/sys/class/net/\$iface/device/power/wakeup_count"
+    [[ -r "\$dev" ]] || continue
+    current="\$(cat "\$dev" 2>/dev/null || true)"
+    [[ "\$current" =~ ^[0-9]+\$ ]] || continue
+    if (( current > old )); then
+      log "Network (WoL) wake detected on \$iface (\$old->\$current); skipping CEC TV wake"
+      return 0
+    fi
+  done < "\$SNAPSHOT_FILE"
+  return 1
+}
 
 restart_cecd() {
   if ! systemctl --user restart cecd.service >/dev/null 2>&1; then
@@ -525,12 +592,16 @@ main() {
 
   case "\$ACTION" in
     standby)
+      snapshot_network_wakeup_counts
       sleep 2
       call_cec Standby 0 || warn "Standby command failed"
       ;;
     wake)
       if [[ -z "\$ACTIVE_SOURCE" ]]; then
         warn "Wake requested without an active-source argument"
+        exit 0
+      fi
+      if skip_cec_wake_on_network && network_wake_detected; then
         exit 0
       fi
       sleep 3
@@ -556,6 +627,7 @@ install_cec() {
 
   ensure_var_layout
   install_cec_helper
+  ensure_cec_wake_policy_default
 
   log "Writing CEC sleep and wake services"
   cat <<EOF2 | write_file "$CEC_SLEEP_SERVICE" 0644
@@ -1300,7 +1372,7 @@ verify() {
 uninstall_cec_setup() {
   log "Disabling CEC sleep/wake services"
   systemctl disable --now cec-sleep.service cec-wake.service 2>/dev/null || true
-  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$LEGACY_CEC_HELPER"
+  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$LEGACY_CEC_HELPER"
   refresh_managed_layout
   log "Removed CEC sleep/wake configuration installed by this script"
 }
@@ -1317,7 +1389,7 @@ uninstall_all() {
   log "Disabling installed services"
   systemctl disable --now cec-sleep.service cec-wake.service bt-wakeup.service 2>/dev/null || true
   rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$BT_WAKE_SERVICE" \
-    "$BT_WAKE_RULE" "$MTK_RULE" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
+    "$BT_WAKE_RULE" "$MTK_RULE" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
     "$CEC_HELPER" "$BT_HELPER" "$LEGACY_CEC_HELPER" "$LEGACY_BT_HELPER"
   refresh_managed_layout
   log "Removed CEC and Bluetooth wake configuration installed by this script"
