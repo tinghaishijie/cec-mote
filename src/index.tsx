@@ -278,7 +278,7 @@ function SetupSection({
         <PanelSectionRow>
           <ToggleField
             label="Skip TV wake when streaming"
-            description="Don't turn on the TV when the PC is woken over the network (Wake-on-LAN / Moonlight)."
+            description="Only wake the TV when a game controller is connected on resume, so a Moonlight / Wake-on-LAN streaming wake leaves it off."
             checked={wakePolicy.checked}
             disabled={wakePolicy.disabled}
             onChange={wakePolicy.onChange}
