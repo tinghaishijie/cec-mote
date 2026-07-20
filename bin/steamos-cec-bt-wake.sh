@@ -497,13 +497,16 @@ skip_cec_wake_on_network() {
   [[ "\$value" == "1" || "\${value,,}" == "true" ]]
 }
 
-# A physically connected game controller shows up as a joystick node whose
-# backing device is a real USB/Bluetooth device. Steam Input keeps a *virtual*
-# joystick around at all times (under /sys/devices/virtual), and keyboards/mice
-# never create a joystick node, so requiring a non-virtual js* cleanly means "a
-# real controller is connected" (a local wake). A headless Wake-on-LAN /
-# Moonlight wake has none. A controller battery under /sys/class/power_supply is
-# a secondary signal for the rare pad that exposes one without a js node.
+# A physically connected game controller shows up as a joystick node. Its backing
+# device is either a real bus device (kernel driver, e.g. PS5 hid-playstation) or,
+# for controllers routed through userspace HID (Steam Input, Bluetooth Xbox pads),
+# lives under /sys/devices/virtual/misc/uhid/<bus:vid:pid>/. Either counts as a
+# real controller. What we must exclude is Steam Input's *emulated* pad, which is
+# a plain /sys/devices/virtual/input/ device with no uhid in its path. Keyboards
+# and mice never create a joystick node. A controller battery under
+# /sys/class/power_supply (name containing controller/gamepad) is a secondary
+# signal. Any of these present after resume means a person is at the console
+# (a local wake); a headless Wake-on-LAN / Moonlight wake has none.
 local_controller_connected() {
   local js target entry name
   for js in /sys/class/input/js*; do
@@ -511,8 +514,9 @@ local_controller_connected() {
     target="\$(readlink -f "\$js/device" 2>/dev/null || true)"
     [[ -n "\$target" ]] || continue
     case "\$target" in
-      */devices/virtual/*) continue ;;
-      *) return 0 ;;
+      */uhid/*) return 0 ;;             # physical HID controller via userspace HID
+      */devices/virtual/*) continue ;;  # Steam Input's emulated (virtual) pad
+      *) return 0 ;;                    # kernel-driver controller on a real bus
     esac
   done
   for entry in /sys/class/power_supply/*; do
