@@ -277,8 +277,8 @@ function SetupSection({
       {wakePolicy ? (
         <PanelSectionRow>
           <ToggleField
-            label="Skip TV wake when streaming"
-            description="Only wake the TV when a game controller is connected on resume, so a Moonlight / Wake-on-LAN streaming wake leaves it off."
+            label="Turn TV off when streaming"
+            description="A normal power-button or controller wake always turns the TV on. When a Moonlight / Wake-on-LAN stream actually starts after resume (within a ~5 min window), turn the TV back off instead."
             checked={wakePolicy.checked}
             disabled={wakePolicy.disabled}
             onChange={wakePolicy.onChange}
