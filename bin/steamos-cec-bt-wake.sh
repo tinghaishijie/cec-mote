@@ -582,22 +582,31 @@ main() {
         warn "Wake requested without an active-source argument"
         exit 0
       fi
-      # Always turn the TV on: at resume time a local power-button wake and a
-      # WoL-then-stream wake are indistinguishable, so we wake the TV and let the
-      # cec-stream-watch service turn it back off if a stream actually starts.
+      # At resume time a local power-button wake and a WoL-then-stream wake are
+      # indistinguishable, so we wake the TV and let cec-stream-watch (ordered
+      # After= this service) turn it back off if a stream actually starts. The one
+      # exception: if the skip policy is on and a stream is ALREADY up by the time
+      # we are about to transmit, this is unambiguously a stream resume, so skip
+      # the wake entirely and avoid flashing the TV on just to turn it off again.
       restart_cecd
       wait_for_cecd_object || true
       sleep 3
+      if skip_cec_wake_on_network && streaming_session_active; then
+        log "Streaming session already active at wake; leaving the TV off"
+        exit 0
+      fi
       call_cec Wake || warn "Wake command failed"
       sleep 2
       call_cec SetActiveSource "\$ACTIVE_SOURCE" || warn "SetActiveSource command failed"
       ;;
     watch-stream)
-      # Runs in parallel after resume. Only while the skip policy is on, watch for
-      # a real streaming session to appear (the user connects seconds/minutes after
-      # the WoL wake) and, when it does, send CEC standby to turn the TV back off.
-      # Bounded to STREAM_WATCH_SECONDS so a later unrelated stream never interrupts
-      # ongoing local use.
+      # Ordered After= cec-wake.service, so the wake sequence has fully finished
+      # before we start polling. Only while the skip policy is on, watch for a real
+      # streaming session to appear (the user connects seconds/minutes after the WoL
+      # wake) and, when it does, send CEC standby to turn the TV back off. Because we
+      # run strictly after the wake, our standby can never be clobbered by a later
+      # Wake. Bounded to STREAM_WATCH_SECONDS so a later unrelated stream never
+      # interrupts ongoing local use.
       if ! skip_cec_wake_on_network; then
         exit 0
       fi
@@ -671,7 +680,7 @@ EOF2
   cat <<EOF2 | write_file "$CEC_STREAM_WATCH_SERVICE" 0644
 [Unit]
 Description=CEC TV Standby when a stream starts after resume
-After=suspend.target
+After=suspend.target cec-wake.service
 
 [Service]
 Type=oneshot
