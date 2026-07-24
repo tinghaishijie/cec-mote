@@ -27,5 +27,8 @@ appears it sends CEC standby to turn the TV back off. The watcher is ordered to 
 strictly after the wake finishes, so its standby is never overridden by the wake.
 If a stream is already active at the moment the TV would be woken, the wake is
 skipped and the TV stays off; if the stream connects later the TV briefly turns on
-and then off — you are remote, so you don't see it. Toggle it from the **CEC Sleep /
+and then off — you are remote, so you don't see it. Only a stream that (re)connects
+*after* the resume counts: the devices from a session that was still up when you
+slept are recorded at suspend and ignored on the next resume, so suspending the host
+mid-stream and later waking it locally still powers the TV on. Toggle it from the **CEC Sleep /
 Wake** section ("Turn TV off when streaming").

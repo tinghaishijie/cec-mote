@@ -486,6 +486,10 @@ CEC_INTERFACE="$CEC_INTERFACE"
 POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
 STREAM_WATCH_SECONDS=300
 STREAM_WATCH_INTERVAL=2
+# Snapshot of the streaming devices present at the last suspend. Lives in the
+# user's tmpfs runtime dir: it survives suspend/resume but is wiped on reboot, so
+# it never carries stale state across a full power cycle.
+STREAM_BASELINE_FILE="\${XDG_RUNTIME_DIR:-/tmp}/steamos-cec-bt-wake-stream-baseline"
 
 log()  { printf 'cec-control: %s\n' "\$*" >&2; }
 warn() { printf 'cec-control: %s\n' "\$*" >&2; }
@@ -501,24 +505,46 @@ skip_cec_wake_on_network() {
   [[ "\$value" == "1" || "\${value,,}" == "true" ]]
 }
 
-# Detect an active Moonlight/Sunshine streaming session by its virtual input
-# devices. Sunshine always keeps a "Mouse passthrough" / "Keyboard passthrough"
-# uinput device, but session-only devices ("Pen passthrough", "Touch passthrough",
-# a gamepad passthrough, ...) show up under /sys/class/input ONLY while a client is
-# actively streaming, and stay for the whole session. This is a host-side signal
-# needing no access to Sunshine's sandbox and, unlike the sub-second TCP handshake,
-# it is stable for the entire stream so a slow poll reliably catches it.
-streaming_session_active() {
+# List the session-only Moonlight/Sunshine streaming input devices present right
+# now, one stable id (its /sys/class/input/inputN name) per line. Sunshine always
+# keeps a "Mouse passthrough" / "Keyboard passthrough" uinput device, but
+# session-only devices ("Pen passthrough", "Touch passthrough", a gamepad
+# passthrough, ...) show up ONLY while a client is actively streaming. This is a
+# host-side signal needing no access to Sunshine's sandbox.
+list_stream_devices() {
   local f name
   for f in /sys/class/input/*/name; do
     [[ -r "\$f" ]] || continue
     name="\$(cat "\$f" 2>/dev/null)"
     case "\$name" in
       "Mouse passthrough"*|"Keyboard passthrough"*) continue ;;
-      *passthrough*) return 0 ;;
+      *passthrough*) basename "\$(dirname "\$f")" ;;
     esac
   done
-  return 1
+}
+
+# True only if a session-only streaming device is present that was NOT already
+# there at the last suspend (see STREAM_BASELINE_FILE). Diffing against that
+# baseline keeps devices left over from a stream that was still up when we slept
+# (the client never disconnected) from masquerading as a fresh post-resume stream
+# and wrongly suppressing the TV wake. A genuine reconnect creates new inputN
+# devices, which are absent from the baseline and so are detected.
+streaming_session_active() {
+  local current baseline
+  current="\$(list_stream_devices | sort -u)"
+  [[ -n "\$current" ]] || return 1
+  if [[ -r "\$STREAM_BASELINE_FILE" ]]; then
+    baseline="\$(sort -u "\$STREAM_BASELINE_FILE" 2>/dev/null || true)"
+  else
+    baseline=""
+  fi
+  comm -23 <(printf '%s\n' "\$current") <(printf '%s\n' "\$baseline") | grep -q .
+}
+
+# Record the streaming devices present right now as the baseline to diff against
+# on the next resume. Called just before we suspend.
+snapshot_stream_baseline() {
+  list_stream_devices | sort -u > "\$STREAM_BASELINE_FILE" 2>/dev/null || true
 }
 
 restart_cecd() {
@@ -572,6 +598,9 @@ call_cec() {
 main() {
   case "\$ACTION" in
     standby)
+      # Record which streaming devices exist now, so the next resume can tell a
+      # leftover pre-suspend stream from a genuinely new post-resume one.
+      snapshot_stream_baseline
       restart_cecd
       wait_for_cecd_object || true
       sleep 2
@@ -585,9 +614,10 @@ main() {
       # At resume time a local power-button wake and a WoL-then-stream wake are
       # indistinguishable, so we wake the TV and let cec-stream-watch (ordered
       # After= this service) turn it back off if a stream actually starts. The one
-      # exception: if the skip policy is on and a stream is ALREADY up by the time
-      # we are about to transmit, this is unambiguously a stream resume, so skip
-      # the wake entirely and avoid flashing the TV on just to turn it off again.
+      # exception: if the skip policy is on and a NEW stream (one that appeared
+      # since the last suspend, not a leftover from before it) is already up by the
+      # time we are about to transmit, this is unambiguously a stream resume, so
+      # skip the wake entirely and avoid flashing the TV on just to turn it off.
       restart_cecd
       wait_for_cecd_object || true
       sleep 3
