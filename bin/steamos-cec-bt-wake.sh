@@ -22,6 +22,7 @@ LEGACY_STATE_FILE="/etc/steamos-cec-bt-wake.conf"
 CEC_SLEEP_SERVICE="/etc/systemd/system/cec-sleep.service"
 CEC_WAKE_SERVICE="/etc/systemd/system/cec-wake.service"
 CEC_STREAM_WATCH_SERVICE="/etc/systemd/system/cec-stream-watch.service"
+CEC_STARTUP_SERVICE="/etc/systemd/system/cec-startup.service"
 BT_WAKE_SERVICE="/etc/systemd/system/bt-wakeup.service"
 BT_WAKE_RULE="/etc/udev/rules.d/91-bluetooth-wakeup.rules"
 CEC_HELPER="$VAR_LIB_DIR/cec-control"
@@ -414,6 +415,7 @@ atomic_keep_paths() {
 /etc/systemd/system/cec-sleep.service
 /etc/systemd/system/cec-wake.service
 /etc/systemd/system/cec-stream-watch.service
+/etc/systemd/system/cec-startup.service
 /etc/systemd/system/bt-wakeup.service
 /etc/udev/rules.d/91-bluetooth-wakeup.rules
 /etc/udev/rules.d/99-btusb-mediatek.rules
@@ -429,6 +431,7 @@ atomic_keep_paths_for_component() {
 /etc/systemd/system/cec-sleep.service
 /etc/systemd/system/cec-wake.service
 /etc/systemd/system/cec-stream-watch.service
+/etc/systemd/system/cec-startup.service
 /etc/atomic-update.conf.d/steamos-cec-bt-wake.conf
 EOF2
       ;;
@@ -486,6 +489,8 @@ CEC_INTERFACE="$CEC_INTERFACE"
 POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
 STREAM_WATCH_SECONDS=300
 STREAM_WATCH_INTERVAL=2
+BOOT_BUS_WAIT_SECONDS=180
+BOOT_SETTLE_SECONDS=5
 # Snapshot of the streaming devices present at the last suspend. Lives in the
 # user's tmpfs runtime dir: it survives suspend/resume but is wiped on reboot, so
 # it never carries stale state across a full power cycle.
@@ -606,6 +611,21 @@ main() {
       sleep 2
       call_cec Standby 0 || warn "Standby command failed"
       ;;
+    boot)
+      # Started at boot before the user session exists: wait for the session bus
+      # that hosts cecd, give gamescope a moment to bring the display up, then run
+      # the regular wake sequence below.
+      local waited=0
+      until [[ -S "\${XDG_RUNTIME_DIR:-}/bus" ]]; do
+        if (( waited >= BOOT_BUS_WAIT_SECONDS )); then
+          warn "Timed out waiting for the session bus; not waking the TV"
+          exit 0
+        fi
+        sleep 1
+        waited=\$(( waited + 1 ))
+      done
+      sleep "\$BOOT_SETTLE_SECONDS"
+      ;&
     wake)
       if [[ -z "\$ACTIVE_SOURCE" ]]; then
         warn "Wake requested without an active-source argument"
@@ -722,6 +742,26 @@ ExecStart=$CEC_HELPER watch-stream
 
 [Install]
 WantedBy=suspend.target
+EOF2
+
+  # cecd lives on the desktop user's session bus, which only appears once the
+  # display manager logs the user in -- after graphical.target is reached. So
+  # this must not be ordered After=graphical.target (that is a cycle with
+  # WantedBy= and systemd drops the job); instead Type=exec lets boot continue
+  # while the helper waits for the session bus itself.
+  cat <<EOF2 | write_file "$CEC_STARTUP_SERVICE" 0644
+[Unit]
+Description=CEC TV Wake on Boot
+
+[Service]
+Type=exec
+User=$desktop_user
+Environment=XDG_RUNTIME_DIR=/run/user/$desktop_uid
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$desktop_uid/bus
+ExecStart=$CEC_HELPER boot $physical_int
+
+[Install]
+WantedBy=graphical.target
 EOF2
 
   cat <<EOF2 | write_file "$CEC_STATE_FILE" 0644
@@ -1154,13 +1194,13 @@ verify_atomic_keep_list() {
 
   case "$component" in
     cec)
-      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     bluetooth)
       installed_paths=("$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     *)
-      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
   esac
 
@@ -1202,6 +1242,7 @@ report_holo_sync_var_status() {
     "$CEC_SLEEP_SERVICE"
     "$CEC_WAKE_SERVICE"
     "$CEC_STREAM_WATCH_SERVICE"
+    "$CEC_STARTUP_SERVICE"
     "$BT_WAKE_SERVICE"
     "$BT_WAKE_RULE"
     "$MTK_RULE"
@@ -1243,7 +1284,7 @@ report_holo_sync_var_status() {
 
 cec_files_exist() {
   local path
-  for path in "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$LEGACY_CEC_HELPER" "$STATE_FILE" "$LEGACY_STATE_FILE"; do
+  for path in "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$LEGACY_CEC_HELPER" "$STATE_FILE" "$LEGACY_STATE_FILE"; do
     [[ -e "$path" ]] && return 0
   done
   return 1
@@ -1324,6 +1365,11 @@ verify_cec() {
   (( service_rc > 0 )) && partial_damage=1
 
   report_service_installed cec-stream-watch.service "$CEC_STREAM_WATCH_SERVICE"
+  service_rc=$?
+  failures=$((failures + service_rc))
+  (( service_rc > 0 )) && partial_damage=1
+
+  report_service_installed cec-startup.service "$CEC_STARTUP_SERVICE"
   service_rc=$?
   failures=$((failures + service_rc))
   (( service_rc > 0 )) && partial_damage=1
@@ -1438,8 +1484,8 @@ verify() {
 
 uninstall_cec_setup() {
   log "Disabling CEC sleep/wake services"
-  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service 2>/dev/null || true
-  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$LEGACY_CEC_HELPER"
+  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service 2>/dev/null || true
+  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$LEGACY_CEC_HELPER"
   refresh_managed_layout
   log "Removed CEC sleep/wake configuration installed by this script"
 }
@@ -1454,8 +1500,8 @@ uninstall_bluetooth_setup() {
 
 uninstall_all() {
   log "Disabling installed services"
-  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service bt-wakeup.service 2>/dev/null || true
-  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$BT_WAKE_SERVICE" \
+  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service bt-wakeup.service 2>/dev/null || true
+  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" \
     "$BT_WAKE_RULE" "$MTK_RULE" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
     "$CEC_HELPER" "$BT_HELPER" "$LEGACY_CEC_HELPER" "$LEGACY_BT_HELPER"
   refresh_managed_layout
@@ -1494,7 +1540,7 @@ SUMMARY
   systemctl daemon-reload
   udevadm control --reload-rules
 
-  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service
+  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service
 
   log "CEC installation complete"
   if ! verify_cec; then
@@ -1614,7 +1660,7 @@ SUMMARY
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=usb --action=add || true
 
-  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service bt-wakeup.service
+  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service bt-wakeup.service
   systemctl restart bt-wakeup.service
 
   log "Installation complete"
