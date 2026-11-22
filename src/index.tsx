@@ -14,7 +14,7 @@ import { FaWrench } from "react-icons/fa";
 type ActionName = "volume_up" | "volume_down" | "mute";
 type SetupAction = "verify" | "install" | "uninstall";
 type SetupState = "configured" | "needs_setup" | "needs_repair" | "error";
-type SetupComponent = "cec" | "bluetooth";
+type SetupComponent = "cec" | "bluetooth" | "gamepad";
 
 interface CecStatus {
   ready: boolean;
@@ -79,6 +79,9 @@ const uninstallCecSetup = callable<[], SetupStatus>("uninstall_cec_setup");
 const getBluetoothSetupStatus = callable<[], SetupStatus>("get_bluetooth_setup_status");
 const installBluetoothSetup = callable<[], SetupStatus>("install_bluetooth_setup");
 const uninstallBluetoothSetup = callable<[], SetupStatus>("uninstall_bluetooth_setup");
+const getGamepadSetupStatus = callable<[], SetupStatus>("get_gamepad_setup_status");
+const installGamepadSetup = callable<[], SetupStatus>("install_gamepad_setup");
+const uninstallGamepadSetup = callable<[], SetupStatus>("uninstall_gamepad_setup");
 const getCecWakePolicy = callable<[], CecWakePolicy>("get_cec_wake_policy");
 const setCecWakePolicy = callable<[boolean], CecWakePolicyResult>("set_cec_wake_policy");
 
@@ -91,6 +94,7 @@ const ACTIONS: Record<ActionName, () => Promise<CecActionResult>> = {
 const SETUP_STATUS_CALLS: Record<SetupComponent, () => Promise<SetupStatus>> = {
   cec: getCecSetupStatus,
   bluetooth: getBluetoothSetupStatus,
+  gamepad: getGamepadSetupStatus,
 };
 
 const SETUP_ACTIONS: Record<SetupComponent, Record<Exclude<SetupAction, "verify">, () => Promise<SetupStatus>>> = {
@@ -101,6 +105,10 @@ const SETUP_ACTIONS: Record<SetupComponent, Record<Exclude<SetupAction, "verify"
   bluetooth: {
     install: installBluetoothSetup,
     uninstall: uninstallBluetoothSetup,
+  },
+  gamepad: {
+    install: installGamepadSetup,
+    uninstall: uninstallGamepadSetup,
   },
 };
 
@@ -132,6 +140,7 @@ const ACTION_LABELS: Record<ActionName, string> = {
 const COMPONENT_LABELS: Record<SetupComponent, string> = {
   cec: "CEC Sleep / Wake",
   bluetooth: "Bluetooth Wake",
+  gamepad: "Bluetooth Controller Fix",
 };
 
 function setupStateLabel(state: SetupState): string {
@@ -195,6 +204,7 @@ function SetupSection({
   onRefresh,
   onUninstall,
   wakePolicy,
+  about,
 }: {
   title: string;
   status: SetupStatus | null;
@@ -208,6 +218,7 @@ function SetupSection({
     disabled: boolean;
     onChange: (value: boolean) => void;
   };
+  about?: string;
 }) {
   const statusLabel = loading
     ? `Checking ${title.toLowerCase()}...`
@@ -219,6 +230,12 @@ function SetupSection({
 
   return (
     <PanelSection title={title}>
+      {about ? (
+        <PanelSectionRow>
+          <Field focusable highlightOnFocus description={about} />
+        </PanelSectionRow>
+      ) : null}
+
       <PanelSectionRow>
         <Field
           focusable
@@ -315,10 +332,12 @@ function Content() {
   const [setupStatus, setSetupStatus] = useState<Record<SetupComponent, SetupStatus | null>>({
     cec: null,
     bluetooth: null,
+    gamepad: null,
   });
   const [setupLoading, setSetupLoading] = useState<Record<SetupComponent, boolean>>({
     cec: true,
     bluetooth: true,
+    gamepad: true,
   });
   const [pending, setPending] = useState<Record<ActionName, boolean>>({
     volume_up: false,
@@ -328,6 +347,7 @@ function Content() {
   const [setupPending, setSetupPending] = useState<Record<SetupComponent, SetupAction | null>>({
     cec: null,
     bluetooth: null,
+    gamepad: null,
   });
   const [wakePolicy, setWakePolicy] = useState(true);
   const [wakePolicyPending, setWakePolicyPending] = useState(false);
@@ -413,6 +433,7 @@ function Content() {
     void loadStatus();
     void loadSetupStatus("cec");
     void loadSetupStatus("bluetooth");
+    void loadSetupStatus("gamepad");
     void loadWakePolicy();
   }, []);
 
@@ -535,6 +556,17 @@ function Content() {
         onInstall={() => void handleSetupAction("bluetooth", "install")}
         onRefresh={() => void loadSetupStatus("bluetooth")}
         onUninstall={() => void handleSetupAction("bluetooth", "uninstall")}
+      />
+
+      <SetupSection
+        title={COMPONENT_LABELS.gamepad}
+        status={setupStatus.gamepad}
+        loading={setupLoading.gamepad}
+        pending={setupPending.gamepad}
+        onInstall={() => void handleSetupAction("gamepad", "install")}
+        onRefresh={() => void loadSetupStatus("gamepad")}
+        onUninstall={() => void handleSetupAction("gamepad", "uninstall")}
+        about="For Bluetooth controllers that pose as an Xbox Wireless Controller (e.g. Flydigi VADER3) and briefly stop responding in Steam after connecting. Reconnect the controller after setup."
       />
     </>
   );

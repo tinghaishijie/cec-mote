@@ -7,6 +7,7 @@
 - sends HDMI-CEC volume commands through the built-in `cecd` D-Bus service
 - assists with installing, repairing, verifying, and uninstalling services to sleep tv on system sleep, and turn on / change input of tv on system wake and on boot, specifically when paired with active DP to HDMI adaptors such as the UGREEN 8k DP to HDMI Adaptor. Additionally it auto discovers bluetooth dongles and enables them as bluetooth wake targets
 - can turn the TV back off when the PC is being used only for a Wake-on-LAN stream (e.g. a Moonlight/Sunshine session), so a headless streaming session does not leave the TV on
+- can install an opt-in fix for Bluetooth controllers that pose as an Xbox Wireless Controller and briefly stop responding in Steam after connecting (see below)
 
 The plugin does not talk to the CEC adapter directly. It uses `cecd` as the sole controller and sends only the validated high-level D-Bus methods exposed by `com.steampowered.CecDaemon1.CecDevice1`.
 
@@ -38,3 +39,42 @@ and then off — you are remote, so you don't see it. Only a stream that (re)con
 suspend and ignored on the next resume), so suspending the host
 mid-stream and later waking it locally still powers the TV on. Toggle it from the **CEC Sleep /
 Wake** section ("Turn TV off when streaming").
+
+## Bluetooth controller fix
+
+Some Bluetooth controllers (e.g. the Flydigi VADER3) identify themselves as an
+Xbox Wireless Controller (`045E:02E0`) but never answer HID `GET_REPORT`
+requests. Every such request blocks its caller for about 3 seconds. Steam's
+controller thread sends them through the controller's hidraw node and by reading
+the controller battery (the kernel queries the controller on each read, because
+the battery level lives in an input report the controller never sends), so input
+freezes for a moment after the controller connects or the PC resumes.
+
+The **Bluetooth Controller Fix** section installs a udev rule
+(`/etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules`, kept across SteamOS
+updates) that, for Bluetooth HID devices `0005:045E:02E0` only:
+
+- removes user access to the controller's hidraw node, so Steam reads it through
+  its evdev node instead, and
+- makes the controller battery's `status`, `capacity` and `uevent` attributes
+  root-only, so those reads fail immediately instead of hanging.
+
+It also preloads the `hid-microsoft` driver at boot
+(`/etc/modules-load.d/cec-mote-hid-microsoft.conf`). Otherwise the first
+connection after a boot binds the generic HID driver and rebinds a few seconds
+later, which recreates the battery with default permissions and brings the
+freeze back until the controller reconnects.
+
+Buttons, sticks and rumble keep working; the controller's battery level is no
+longer shown. Reconnect the controller after installing or uninstalling.
+
+`045E:02E0` is also the real Bluetooth ID of an Xbox One S controller on old
+firmware. Such a genuine controller is matched too: it keeps working, but loses
+its battery display while the fix is installed.
+
+The fix shortens the freeze rather than removing every trace of it: some requests
+still reach the controller (the rule only blocks unprivileged programs), so
+`bluetoothd` keeps logging `HIDP GET_REPORT request timed out` for a while after
+each connection.
+CLI: `sudo ./bin/steamos-cec-bt-wake.sh --install --gamepad` (also `--verify`,
+`--uninstall`).

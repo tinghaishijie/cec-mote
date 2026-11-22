@@ -173,6 +173,59 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed["state"], "needs_repair")
         self.assertEqual(parsed["summary"], "CEC sleep/wake setup exists but needs repair.")
 
+    def test_parse_gamepad_setup_result_needs_setup(self):
+        result = mote_main.CommandResult(
+            args=tuple(),
+            returncode=1,
+            stdout="\n".join(
+                [
+                    "Bluetooth controller stall fix",
+                    "------------------------------",
+                    "FAIL Controller stall fix rule missing: /etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules",
+                    "Verification found 1 problem(s).",
+                ]
+            ),
+            stderr="",
+        )
+
+        parsed = self.plugin._parse_setup_result("verify", "gamepad", result)
+
+        self.assertEqual(parsed["component"], "gamepad")
+        self.assertEqual(parsed["state"], "needs_setup")
+        self.assertEqual(parsed["summary"], "Controller stall fix setup is not installed yet.")
+
+    def test_parse_gamepad_setup_result_configured_keeps_reconnect_warning(self):
+        result = mote_main.CommandResult(
+            args=tuple(),
+            returncode=0,
+            stdout="\n".join(
+                [
+                    "OK   Controller stall fix rule exists: /etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules",
+                    "OK   Controller stall fix helper exists: /var/lib/steamos-cec-bt-wake/gamepad-battery-lock",
+                    "OK   Matching controller connected: 0005:045E:02E0.0014",
+                    "WARN /dev/hidraw6 is still user-accessible; reconnect the controller to apply the fix",
+                    "Verification passed.",
+                ]
+            ),
+            stderr="",
+        )
+
+        parsed = self.plugin._parse_setup_result("verify", "gamepad", result)
+
+        self.assertEqual(parsed["state"], "configured")
+        self.assertEqual(parsed["summary"], "Controller stall fix setup is installed and healthy.")
+        self.assertEqual(len(parsed["warnings"]), 1)
+
+    async def test_gamepad_setup_runs_script_with_gamepad_component(self):
+        result = mote_main.CommandResult(args=tuple(), returncode=0, stdout="Verification passed.", stderr="")
+        with patch.object(self.plugin, "_run_command", AsyncMock(return_value=result)) as run_mock:
+            parsed = await self.plugin.install_gamepad_setup()
+
+        args = run_mock.await_args.args[0]
+        self.assertEqual(args[-3:], ("--install", "--gamepad", "--yes"))
+        self.assertEqual(parsed["component"], "gamepad")
+        self.assertEqual(parsed["action"], "install")
+
     def test_get_setup_script_path_uses_bundled_asset(self):
         script_path = self.plugin._get_setup_script_path()
         self.assertTrue(script_path.endswith("bin/steamos-cec-bt-wake.sh"))
