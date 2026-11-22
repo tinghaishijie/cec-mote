@@ -59,6 +59,12 @@ updates) that, for Bluetooth HID devices `0005:045E:02E0` only:
 - makes the controller battery's `status`, `capacity` and `uevent` attributes
   root-only, so those reads fail immediately instead of hanging.
 
+It also preloads the `hid-microsoft` driver at boot
+(`/etc/modules-load.d/cec-mote-hid-microsoft.conf`). Otherwise the first
+connection after a boot binds the generic HID driver and rebinds a few seconds
+later, which recreates the battery with default permissions and brings the
+freeze back until the controller reconnects.
+
 Buttons, sticks and rumble keep working; the controller's battery level is no
 longer shown. Reconnect the controller after installing or uninstalling.
 

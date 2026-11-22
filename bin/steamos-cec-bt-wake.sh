@@ -32,6 +32,7 @@ LEGACY_BT_HELPER="$LEGACY_HELPER_DIR/enable-bluetooth-wakeup"
 MTK_RULE="/etc/udev/rules.d/99-btusb-mediatek.rules"
 GAMEPAD_FIX_RULE="/etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules"
 GAMEPAD_FIX_HELPER="$VAR_LIB_DIR/gamepad-battery-lock"
+GAMEPAD_FIX_MODULES="/etc/modules-load.d/cec-mote-hid-microsoft.conf"
 # HID device names (bus:vendor:product) of Bluetooth controllers that claim to
 # be an Xbox Wireless Controller but never answer HID GET_REPORT, e.g. the
 # Flydigi VADER3. Bus 0005 is Bluetooth.
@@ -429,6 +430,7 @@ atomic_keep_paths() {
 /etc/udev/rules.d/91-bluetooth-wakeup.rules
 /etc/udev/rules.d/99-btusb-mediatek.rules
 /etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules
+/etc/modules-load.d/cec-mote-hid-microsoft.conf
 /etc/atomic-update.conf.d/steamos-cec-bt-wake.conf
 EOF2
 }
@@ -455,6 +457,7 @@ EOF2
     gamepad)
       cat <<EOF2
 /etc/udev/rules.d/72-cec-mote-bt-gamepad-stall.rules
+/etc/modules-load.d/cec-mote-hid-microsoft.conf
 /etc/atomic-update.conf.d/steamos-cec-bt-wake.conf
 EOF2
       ;;
@@ -900,23 +903,15 @@ install_gamepad_fix() {
 
   cat <<'EOF2' | write_file "$GAMEPAD_FIX_HELPER" 0755
 #!/bin/sh
-# Called by the cec-mote controller stall udev rules with the sysfs path of a
-# HID device or of its battery. Makes the battery attributes whose reads query
-# the controller root-only. Given a HID device, waits briefly for hid-input to
-# register the battery first.
-dev="${1:?sysfs path required}"
-lock() {
-  chmod 0400 "$1/status" "$1/capacity" "$1/uevent" 2>/dev/null
-}
-if [ -e "$dev/status" ]; then
-  lock "$dev"
-  exit 0
-fi
+# Called by the cec-mote controller stall udev rule with a HID device's sysfs
+# path. Waits briefly for hid-input to register the controller battery, then
+# makes the attributes whose reads query the controller root-only.
+dev="${1:?HID sysfs path required}"
 i=0
 while [ "$i" -lt 40 ]; do
   for ps in "$dev"/power_supply/*; do
     [ -e "$ps/status" ] || continue
-    lock "$ps"
+    chmod 0400 "$ps/status" "$ps/capacity" "$ps/uevent" 2>/dev/null
     exit 0
   done
   sleep 0.05
@@ -930,15 +925,23 @@ EOF2
 # Drop the uaccess tag (added by 70-steam-jupiter-input.rules, applied by
 # 73-seat-late.rules) so Steam falls back to the evdev node instead of hidraw.
 KERNEL=="hidraw*", KERNELS=="$GAMEPAD_FIX_HID_MATCH.*", TAG-="uaccess"
-# Lock the battery attributes. Runs on the parent HID device: udev holds the
-# child input/power_supply events until it finishes, so it is done before
-# Steam sees the controller.
-ACTION=="add", SUBSYSTEM=="hid", KERNEL=="$GAMEPAD_FIX_HID_MATCH.*", RUN+="$GAMEPAD_FIX_HELPER %S%p"
-# Lock it again whenever the battery itself is (re)created. When the kernel
-# rebinds the controller to another HID driver (hid-generic first, then
-# hid-microsoft once that module is loaded) the battery is registered anew with
-# default permissions, and the HID device gets no second "add" event.
-ACTION=="add", SUBSYSTEM=="power_supply", KERNELS=="$GAMEPAD_FIX_HID_MATCH.*", RUN+="$GAMEPAD_FIX_HELPER %S%p"
+# Lock the battery attributes. Runs on the parent HID device: on "add" udev
+# holds the child input/power_supply events until it finishes, so it is done
+# before Steam sees the controller.
+# "bind" covers a driver rebind (hid-generic first, then hid-microsoft once that
+# module is loaded): the battery is registered anew with default permissions,
+# the HID device gets no second "add" and the kernel sends no "add" for the new
+# battery. udev only gets to that event after its own blocked battery reads, so
+# this is a late safety net; $GAMEPAD_FIX_MODULES avoids the rebind itself.
+ACTION=="add|bind", SUBSYSTEM=="hid", KERNEL=="$GAMEPAD_FIX_HID_MATCH.*", RUN+="$GAMEPAD_FIX_HELPER %S%p"
+EOF2
+
+  # Same idea as SteamOS's own hid-preload.conf: have the driver loaded before
+  # the controller first connects, so the kernel binds it directly instead of
+  # binding hid-generic and rebinding a few seconds later.
+  cat <<'EOF2' | write_file "$GAMEPAD_FIX_MODULES" 0644
+# Managed by cec-mote (steamos-cec-bt-wake.sh --gamepad).
+hid_microsoft
 EOF2
 }
 
@@ -1346,10 +1349,10 @@ verify_atomic_keep_list() {
       installed_paths=("$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     gamepad)
-      installed_paths=("$GAMEPAD_FIX_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$GAMEPAD_FIX_RULE" "$GAMEPAD_FIX_MODULES" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     *)
-      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$GAMEPAD_FIX_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$GAMEPAD_FIX_RULE" "$GAMEPAD_FIX_MODULES" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
   esac
 
@@ -1396,6 +1399,7 @@ report_holo_sync_var_status() {
     "$BT_WAKE_RULE"
     "$MTK_RULE"
     "$GAMEPAD_FIX_RULE"
+    "$GAMEPAD_FIX_MODULES"
     "$ATOMIC_UPDATE_KEEP_FILE"
     "$LEGACY_STATE_FILE"
     "$LEGACY_HELPER_DIR"
@@ -1450,7 +1454,7 @@ bluetooth_files_exist() {
 }
 
 gamepad_fix_files_exist() {
-  [[ -e "$GAMEPAD_FIX_RULE" || -e "$GAMEPAD_FIX_HELPER" ]]
+  [[ -e "$GAMEPAD_FIX_RULE" || -e "$GAMEPAD_FIX_HELPER" || -e "$GAMEPAD_FIX_MODULES" ]]
 }
 
 managed_files_exist() {
@@ -1683,11 +1687,18 @@ verify_gamepad_fix() {
       printf 'FAIL Controller stall fix rule does not match the helper path %s\n' "$GAMEPAD_FIX_HELPER"
       failures=$((failures + 1))
     fi
-    if ! grep -Fq 'SUBSYSTEM=="power_supply"' "$GAMEPAD_FIX_RULE"; then
+    if ! grep -Fq 'ACTION=="add|bind"' "$GAMEPAD_FIX_RULE"; then
       printf 'FAIL Controller stall fix rule is outdated (no battery re-lock on driver rebind); reinstall to update it\n'
       failures=$((failures + 1))
     fi
   else
+    failures=$((failures + 1))
+  fi
+
+  if [[ -r "$GAMEPAD_FIX_MODULES" ]]; then
+    printf 'OK   hid-microsoft preload exists: %s\n' "$GAMEPAD_FIX_MODULES"
+  else
+    printf 'FAIL hid-microsoft preload missing: %s (reinstall to add it)\n' "$GAMEPAD_FIX_MODULES"
     failures=$((failures + 1))
   fi
 
@@ -1733,7 +1744,7 @@ uninstall_bluetooth_setup() {
 
 uninstall_gamepad_fix_setup() {
   log "Removing the Bluetooth controller stall fix"
-  rm -f "$GAMEPAD_FIX_RULE" "$GAMEPAD_FIX_HELPER"
+  rm -f "$GAMEPAD_FIX_RULE" "$GAMEPAD_FIX_HELPER" "$GAMEPAD_FIX_MODULES"
   refresh_managed_layout
   restore_gamepad_fix_on_connected
   log "Removed the controller stall fix installed by this script"
@@ -1743,7 +1754,7 @@ uninstall_all() {
   log "Disabling installed services"
   systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service bt-wakeup.service 2>/dev/null || true
   rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" \
-    "$BT_WAKE_RULE" "$MTK_RULE" "$GAMEPAD_FIX_RULE" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
+    "$BT_WAKE_RULE" "$MTK_RULE" "$GAMEPAD_FIX_RULE" "$GAMEPAD_FIX_MODULES" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
     "$CEC_HELPER" "$BT_HELPER" "$GAMEPAD_FIX_HELPER" "$LEGACY_CEC_HELPER" "$LEGACY_BT_HELPER"
   refresh_managed_layout
   restore_gamepad_fix_on_connected
@@ -1835,6 +1846,7 @@ Bluetooth controller stall fix:
   Matches:            Bluetooth HID $GAMEPAD_FIX_HID_MATCH (controllers posing as an Xbox Wireless Controller)
   udev rule:          $GAMEPAD_FIX_RULE
   Helper:             $GAMEPAD_FIX_HELPER
+  Module preload:     $GAMEPAD_FIX_MODULES
 SUMMARY
 
   confirm "Install the controller stall fix?" || die "Cancelled."
@@ -1844,6 +1856,7 @@ SUMMARY
 
   log "Reloading udev rules"
   udevadm control --reload-rules
+  modprobe hid_microsoft 2>/dev/null || warn "Could not load hid_microsoft now; it will be loaded on the next boot"
   apply_gamepad_fix_to_connected
 
   log "Controller stall fix installation complete; reconnect the controller so Steam reopens it"
