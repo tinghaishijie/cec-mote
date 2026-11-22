@@ -510,12 +510,35 @@ skip_cec_wake_on_network() {
   [[ "\$value" == "1" || "\${value,,}" == "true" ]]
 }
 
-# List the session-only Moonlight/Sunshine streaming input devices present right
-# now, one stable id (its /sys/class/input/inputN name) per line. Sunshine always
-# keeps a "Mouse passthrough" / "Keyboard passthrough" uinput device, but
-# session-only devices ("Pen passthrough", "Touch passthrough", a gamepad
-# passthrough, ...) show up ONLY while a client is actively streaming. This is a
-# host-side signal needing no access to Sunshine's sandbox.
+# Epoch second of the most recent resume from suspend (or of this boot, if the
+# machine has not slept yet). Anything Sunshine logged after this point belongs
+# to the current wake cycle.
+last_resume_epoch() {
+  local ts
+  ts="\$(journalctl -k -b -q -g 'PM: suspend exit' -n 1 -o short-unix --no-pager 2>/dev/null | awk '{print int(\$1)}' || true)"
+  if [[ -z "\$ts" ]]; then
+    ts=\$(( \$(date +%s) - \$(cut -d. -f1 /proc/uptime) ))
+  fi
+  printf '%s\n' "\$ts"
+}
+
+# Primary signal: Sunshine's own "CLIENT CONNECTED" / "CLIENT DISCONNECTED" lines
+# in the journal. True when the newest such line since the last resume is a
+# CONNECTED. This does not depend on how Sunshine names its virtual input
+# devices (newer builds use "libvirtualhid ..." instead of "... passthrough" and
+# keep them around after the client leaves), and a stream left over from before
+# the suspend never counts because its CONNECTED line predates the resume.
+journal_stream_active() {
+  local since last
+  since="\$(last_resume_epoch)"
+  last="\$(journalctl -b -q --since "@\$since" -o cat --no-pager \
+    -g 'Info: CLIENT (CONNECTED|DISCONNECTED)' -n 1 2>/dev/null || true)"
+  [[ "\$last" == *"CLIENT CONNECTED"* ]]
+}
+
+# Legacy signal for older Sunshine builds: session-only "... passthrough" uinput
+# devices (everything except the always-present mouse/keyboard ones), one stable
+# id (its /sys/class/input/inputN name) per line.
 list_stream_devices() {
   local f name
   for f in /sys/class/input/*/name; do
@@ -528,14 +551,13 @@ list_stream_devices() {
   done
 }
 
-# True only if a session-only streaming device is present that was NOT already
-# there at the last suspend (see STREAM_BASELINE_FILE). Diffing against that
-# baseline keeps devices left over from a stream that was still up when we slept
-# (the client never disconnected) from masquerading as a fresh post-resume stream
-# and wrongly suppressing the TV wake. A genuine reconnect creates new inputN
-# devices, which are absent from the baseline and so are detected.
+# True if a streaming session started since the last resume: either Sunshine
+# logged a client connection (see journal_stream_active), or a legacy session-only
+# passthrough device is present that was not there at the last suspend (see
+# STREAM_BASELINE_FILE).
 streaming_session_active() {
   local current baseline
+  journal_stream_active && return 0
   current="\$(list_stream_devices | sort -u)"
   [[ -n "\$current" ]] || return 1
   if [[ -r "\$STREAM_BASELINE_FILE" ]]; then
@@ -660,11 +682,28 @@ main() {
       if ! skip_cec_wake_on_network; then
         exit 0
       fi
-      local elapsed=0
+      local elapsed=0 cycle current_cycle
+      cycle="\$(last_resume_epoch)"
       while (( elapsed < STREAM_WATCH_SECONDS )); do
+        # A watcher that is still running when the machine sleeps and resumes
+        # again is not restarted by systemd, so start a fresh window ourselves.
+        current_cycle="\$(last_resume_epoch)"
+        if [[ "\$current_cycle" != "\$cycle" ]]; then
+          cycle="\$current_cycle"
+          elapsed=0
+        fi
         if streaming_session_active; then
+          # Never transmit while the wake sequence is still running, or its
+          # SetActiveSource would turn the TV straight back on.
+          while [[ "\$(systemctl is-active cec-wake.service 2>/dev/null)" == "activating" ]]; do
+            sleep 1
+          done
           log "Streaming session detected; sending CEC standby to turn the TV off"
           wait_for_cecd_object || true
+          call_cec Standby 0 || warn "Standby command failed"
+          # A TV that is still booting from the wake may ignore the first
+          # standby; repeating it is harmless if the TV is already off.
+          sleep 10
           call_cec Standby 0 || warn "Standby command failed"
           exit 0
         fi

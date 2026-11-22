@@ -20,15 +20,21 @@ When the resume was really for a headless Moonlight/Sunshine stream, the TV shou
 not stay on. A Wake-on-LAN resume does not start the stream immediately — you still
 connect from the client a few seconds (or minutes) later — so the plugin cannot
 decide at resume time. Instead a `cec-stream-watch` service runs for a short window
-after each resume and watches for a stream to actually start (Sunshine creates
-session-only virtual input devices such as "Pen passthrough" / "Touch passthrough"
-under `/sys/class/input` that exist only while a client is streaming); when one
-appears it sends CEC standby to turn the TV back off. The watcher is ordered to run
-strictly after the wake finishes, so its standby is never overridden by the wake.
+after each resume and watches for a stream to actually start: Sunshine writes
+`CLIENT CONNECTED` / `CLIENT DISCONNECTED` lines to the journal, and a stream counts
+as started when the newest such line since the resume is a `CLIENT CONNECTED`. (Older
+Sunshine builds are also recognised by their session-only "Pen passthrough" / "Touch
+passthrough" virtual input devices under `/sys/class/input`; newer builds name their
+devices "libvirtualhid ..." and keep them after the client leaves, so device names
+alone are not a reliable signal.) When a stream starts the watcher sends CEC standby
+to turn the TV back off, and repeats it once ten seconds later in case the TV was
+still powering on. The watcher never transmits while the wake is still running, so
+its standby is never overridden by the wake.
 If a stream is already active at the moment the TV would be woken, the wake is
 skipped and the TV stays off; if the stream connects later the TV briefly turns on
 and then off — you are remote, so you don't see it. Only a stream that (re)connects
-*after* the resume counts: the devices from a session that was still up when you
-slept are recorded at suspend and ignored on the next resume, so suspending the host
+*after* the resume counts: journal lines from before the resume are not considered
+(and legacy devices from a session that was still up when you slept are recorded at
+suspend and ignored on the next resume), so suspending the host
 mid-stream and later waking it locally still powers the TV on. Toggle it from the **CEC Sleep /
 Wake** section ("Turn TV off when streaming").
