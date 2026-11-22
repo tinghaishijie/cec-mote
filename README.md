@@ -61,5 +61,14 @@ updates) that, for Bluetooth HID devices `0005:045E:02E0` only:
 
 Buttons, sticks and rumble keep working; the controller's battery level is no
 longer shown. Reconnect the controller after installing or uninstalling.
+
+`045E:02E0` is also the real Bluetooth ID of an Xbox One S controller on old
+firmware. Such a genuine controller is matched too: it keeps working, but loses
+its battery display while the fix is installed.
+
+The fix shortens the freeze rather than removing every trace of it: some requests
+still reach the controller (the rule only blocks unprivileged programs), so
+`bluetoothd` keeps logging `HIDP GET_REPORT request timed out` for a while after
+each connection.
 CLI: `sudo ./bin/steamos-cec-bt-wake.sh --install --gamepad` (also `--verify`,
 `--uninstall`).

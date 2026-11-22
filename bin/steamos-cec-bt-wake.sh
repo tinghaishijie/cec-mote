@@ -900,15 +900,23 @@ install_gamepad_fix() {
 
   cat <<'EOF2' | write_file "$GAMEPAD_FIX_HELPER" 0755
 #!/bin/sh
-# Called by the cec-mote controller stall udev rule with a HID device's sysfs
-# path. Waits briefly for hid-input to register the controller battery, then
-# makes the attributes whose reads query the controller root-only.
-dev="${1:?HID sysfs path required}"
+# Called by the cec-mote controller stall udev rules with the sysfs path of a
+# HID device or of its battery. Makes the battery attributes whose reads query
+# the controller root-only. Given a HID device, waits briefly for hid-input to
+# register the battery first.
+dev="${1:?sysfs path required}"
+lock() {
+  chmod 0400 "$1/status" "$1/capacity" "$1/uevent" 2>/dev/null
+}
+if [ -e "$dev/status" ]; then
+  lock "$dev"
+  exit 0
+fi
 i=0
 while [ "$i" -lt 40 ]; do
   for ps in "$dev"/power_supply/*; do
     [ -e "$ps/status" ] || continue
-    chmod 0400 "$ps/status" "$ps/capacity" "$ps/uevent" 2>/dev/null
+    lock "$ps"
     exit 0
   done
   sleep 0.05
@@ -926,6 +934,11 @@ KERNEL=="hidraw*", KERNELS=="$GAMEPAD_FIX_HID_MATCH.*", TAG-="uaccess"
 # child input/power_supply events until it finishes, so it is done before
 # Steam sees the controller.
 ACTION=="add", SUBSYSTEM=="hid", KERNEL=="$GAMEPAD_FIX_HID_MATCH.*", RUN+="$GAMEPAD_FIX_HELPER %S%p"
+# Lock it again whenever the battery itself is (re)created. When the kernel
+# rebinds the controller to another HID driver (hid-generic first, then
+# hid-microsoft once that module is loaded) the battery is registered anew with
+# default permissions, and the HID device gets no second "add" event.
+ACTION=="add", SUBSYSTEM=="power_supply", KERNELS=="$GAMEPAD_FIX_HID_MATCH.*", RUN+="$GAMEPAD_FIX_HELPER %S%p"
 EOF2
 }
 
@@ -1668,6 +1681,10 @@ verify_gamepad_fix() {
   if report_file_status "Controller stall fix rule" "$GAMEPAD_FIX_RULE"; then
     if ! grep -Fq "$GAMEPAD_FIX_HELPER" "$GAMEPAD_FIX_RULE"; then
       printf 'FAIL Controller stall fix rule does not match the helper path %s\n' "$GAMEPAD_FIX_HELPER"
+      failures=$((failures + 1))
+    fi
+    if ! grep -Fq 'SUBSYSTEM=="power_supply"' "$GAMEPAD_FIX_RULE"; then
+      printf 'FAIL Controller stall fix rule is outdated (no battery re-lock on driver rebind); reinstall to update it\n'
       failures=$((failures + 1))
     fi
   else
