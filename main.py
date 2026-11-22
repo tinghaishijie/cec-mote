@@ -144,6 +144,15 @@ class Plugin:
     async def uninstall_bluetooth_setup(self) -> dict:
         return await self._run_setup_mode("uninstall", "bluetooth")
 
+    async def get_gamepad_setup_status(self) -> dict:
+        return await self._run_setup_mode("verify", "gamepad")
+
+    async def install_gamepad_setup(self) -> dict:
+        return await self._run_setup_mode("install", "gamepad")
+
+    async def uninstall_gamepad_setup(self) -> dict:
+        return await self._run_setup_mode("uninstall", "gamepad")
+
     async def get_cec_wake_policy(self) -> dict:
         return {"skipOnNetworkWake": self._read_cec_wake_policy()}
 
@@ -668,6 +677,7 @@ class Plugin:
                 "State file missing",
                 "unit missing",
                 "Bluetooth udev rule missing",
+                "Controller stall fix rule missing",
             )
         ) and not ok_lines:
             return "needs_setup"
@@ -708,6 +718,8 @@ class Plugin:
             return "CEC sleep/wake"
         if component == "bluetooth":
             return "Bluetooth wake"
+        if component == "gamepad":
+            return "Controller stall fix"
         return "Sleep/wake"
 
     @staticmethod
