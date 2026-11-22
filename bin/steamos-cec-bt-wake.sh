@@ -22,6 +22,7 @@ LEGACY_STATE_FILE="/etc/steamos-cec-bt-wake.conf"
 CEC_SLEEP_SERVICE="/etc/systemd/system/cec-sleep.service"
 CEC_WAKE_SERVICE="/etc/systemd/system/cec-wake.service"
 CEC_STREAM_WATCH_SERVICE="/etc/systemd/system/cec-stream-watch.service"
+CEC_STARTUP_SERVICE="/etc/systemd/system/cec-startup.service"
 BT_WAKE_SERVICE="/etc/systemd/system/bt-wakeup.service"
 BT_WAKE_RULE="/etc/udev/rules.d/91-bluetooth-wakeup.rules"
 CEC_HELPER="$VAR_LIB_DIR/cec-control"
@@ -414,6 +415,7 @@ atomic_keep_paths() {
 /etc/systemd/system/cec-sleep.service
 /etc/systemd/system/cec-wake.service
 /etc/systemd/system/cec-stream-watch.service
+/etc/systemd/system/cec-startup.service
 /etc/systemd/system/bt-wakeup.service
 /etc/udev/rules.d/91-bluetooth-wakeup.rules
 /etc/udev/rules.d/99-btusb-mediatek.rules
@@ -429,6 +431,7 @@ atomic_keep_paths_for_component() {
 /etc/systemd/system/cec-sleep.service
 /etc/systemd/system/cec-wake.service
 /etc/systemd/system/cec-stream-watch.service
+/etc/systemd/system/cec-startup.service
 /etc/atomic-update.conf.d/steamos-cec-bt-wake.conf
 EOF2
       ;;
@@ -486,6 +489,8 @@ CEC_INTERFACE="$CEC_INTERFACE"
 POLICY_FILE="$VAR_LIB_DIR/cec-wake-policy.conf"
 STREAM_WATCH_SECONDS=300
 STREAM_WATCH_INTERVAL=2
+BOOT_BUS_WAIT_SECONDS=180
+BOOT_SETTLE_SECONDS=5
 # Snapshot of the streaming devices present at the last suspend. Lives in the
 # user's tmpfs runtime dir: it survives suspend/resume but is wiped on reboot, so
 # it never carries stale state across a full power cycle.
@@ -505,12 +510,35 @@ skip_cec_wake_on_network() {
   [[ "\$value" == "1" || "\${value,,}" == "true" ]]
 }
 
-# List the session-only Moonlight/Sunshine streaming input devices present right
-# now, one stable id (its /sys/class/input/inputN name) per line. Sunshine always
-# keeps a "Mouse passthrough" / "Keyboard passthrough" uinput device, but
-# session-only devices ("Pen passthrough", "Touch passthrough", a gamepad
-# passthrough, ...) show up ONLY while a client is actively streaming. This is a
-# host-side signal needing no access to Sunshine's sandbox.
+# Epoch second of the most recent resume from suspend (or of this boot, if the
+# machine has not slept yet). Anything Sunshine logged after this point belongs
+# to the current wake cycle.
+last_resume_epoch() {
+  local ts
+  ts="\$(journalctl -k -b -q -g 'PM: suspend exit' -n 1 -o short-unix --no-pager 2>/dev/null | awk '{print int(\$1)}' || true)"
+  if [[ -z "\$ts" ]]; then
+    ts=\$(( \$(date +%s) - \$(cut -d. -f1 /proc/uptime) ))
+  fi
+  printf '%s\n' "\$ts"
+}
+
+# Primary signal: Sunshine's own "CLIENT CONNECTED" / "CLIENT DISCONNECTED" lines
+# in the journal. True when the newest such line since the last resume is a
+# CONNECTED. This does not depend on how Sunshine names its virtual input
+# devices (newer builds use "libvirtualhid ..." instead of "... passthrough" and
+# keep them around after the client leaves), and a stream left over from before
+# the suspend never counts because its CONNECTED line predates the resume.
+journal_stream_active() {
+  local since last
+  since="\$(last_resume_epoch)"
+  last="\$(journalctl -b -q --since "@\$since" -o cat --no-pager \
+    -g 'Info: CLIENT (CONNECTED|DISCONNECTED)' -n 1 2>/dev/null || true)"
+  [[ "\$last" == *"CLIENT CONNECTED"* ]]
+}
+
+# Legacy signal for older Sunshine builds: session-only "... passthrough" uinput
+# devices (everything except the always-present mouse/keyboard ones), one stable
+# id (its /sys/class/input/inputN name) per line.
 list_stream_devices() {
   local f name
   for f in /sys/class/input/*/name; do
@@ -523,14 +551,13 @@ list_stream_devices() {
   done
 }
 
-# True only if a session-only streaming device is present that was NOT already
-# there at the last suspend (see STREAM_BASELINE_FILE). Diffing against that
-# baseline keeps devices left over from a stream that was still up when we slept
-# (the client never disconnected) from masquerading as a fresh post-resume stream
-# and wrongly suppressing the TV wake. A genuine reconnect creates new inputN
-# devices, which are absent from the baseline and so are detected.
+# True if a streaming session started since the last resume: either Sunshine
+# logged a client connection (see journal_stream_active), or a legacy session-only
+# passthrough device is present that was not there at the last suspend (see
+# STREAM_BASELINE_FILE).
 streaming_session_active() {
   local current baseline
+  journal_stream_active && return 0
   current="\$(list_stream_devices | sort -u)"
   [[ -n "\$current" ]] || return 1
   if [[ -r "\$STREAM_BASELINE_FILE" ]]; then
@@ -606,6 +633,21 @@ main() {
       sleep 2
       call_cec Standby 0 || warn "Standby command failed"
       ;;
+    boot)
+      # Started at boot before the user session exists: wait for the session bus
+      # that hosts cecd, give gamescope a moment to bring the display up, then run
+      # the regular wake sequence below.
+      local waited=0
+      until [[ -S "\${XDG_RUNTIME_DIR:-}/bus" ]]; do
+        if (( waited >= BOOT_BUS_WAIT_SECONDS )); then
+          warn "Timed out waiting for the session bus; not waking the TV"
+          exit 0
+        fi
+        sleep 1
+        waited=\$(( waited + 1 ))
+      done
+      sleep "\$BOOT_SETTLE_SECONDS"
+      ;&
     wake)
       if [[ -z "\$ACTIVE_SOURCE" ]]; then
         warn "Wake requested without an active-source argument"
@@ -640,11 +682,28 @@ main() {
       if ! skip_cec_wake_on_network; then
         exit 0
       fi
-      local elapsed=0
+      local elapsed=0 cycle current_cycle
+      cycle="\$(last_resume_epoch)"
       while (( elapsed < STREAM_WATCH_SECONDS )); do
+        # A watcher that is still running when the machine sleeps and resumes
+        # again is not restarted by systemd, so start a fresh window ourselves.
+        current_cycle="\$(last_resume_epoch)"
+        if [[ "\$current_cycle" != "\$cycle" ]]; then
+          cycle="\$current_cycle"
+          elapsed=0
+        fi
         if streaming_session_active; then
+          # Never transmit while the wake sequence is still running, or its
+          # SetActiveSource would turn the TV straight back on.
+          while [[ "\$(systemctl is-active cec-wake.service 2>/dev/null)" == "activating" ]]; do
+            sleep 1
+          done
           log "Streaming session detected; sending CEC standby to turn the TV off"
           wait_for_cecd_object || true
+          call_cec Standby 0 || warn "Standby command failed"
+          # A TV that is still booting from the wake may ignore the first
+          # standby; repeating it is harmless if the TV is already off.
+          sleep 10
           call_cec Standby 0 || warn "Standby command failed"
           exit 0
         fi
@@ -722,6 +781,26 @@ ExecStart=$CEC_HELPER watch-stream
 
 [Install]
 WantedBy=suspend.target
+EOF2
+
+  # cecd lives on the desktop user's session bus, which only appears once the
+  # display manager logs the user in -- after graphical.target is reached. So
+  # this must not be ordered After=graphical.target (that is a cycle with
+  # WantedBy= and systemd drops the job); instead Type=exec lets boot continue
+  # while the helper waits for the session bus itself.
+  cat <<EOF2 | write_file "$CEC_STARTUP_SERVICE" 0644
+[Unit]
+Description=CEC TV Wake on Boot
+
+[Service]
+Type=exec
+User=$desktop_user
+Environment=XDG_RUNTIME_DIR=/run/user/$desktop_uid
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$desktop_uid/bus
+ExecStart=$CEC_HELPER boot $physical_int
+
+[Install]
+WantedBy=graphical.target
 EOF2
 
   cat <<EOF2 | write_file "$CEC_STATE_FILE" 0644
@@ -1154,13 +1233,13 @@ verify_atomic_keep_list() {
 
   case "$component" in
     cec)
-      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     bluetooth)
       installed_paths=("$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
     *)
-      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
+      installed_paths=("$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" "$BT_WAKE_RULE" "$MTK_RULE" "$ATOMIC_UPDATE_KEEP_FILE")
       ;;
   esac
 
@@ -1202,6 +1281,7 @@ report_holo_sync_var_status() {
     "$CEC_SLEEP_SERVICE"
     "$CEC_WAKE_SERVICE"
     "$CEC_STREAM_WATCH_SERVICE"
+    "$CEC_STARTUP_SERVICE"
     "$BT_WAKE_SERVICE"
     "$BT_WAKE_RULE"
     "$MTK_RULE"
@@ -1243,7 +1323,7 @@ report_holo_sync_var_status() {
 
 cec_files_exist() {
   local path
-  for path in "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$LEGACY_CEC_HELPER" "$STATE_FILE" "$LEGACY_STATE_FILE"; do
+  for path in "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$LEGACY_CEC_HELPER" "$STATE_FILE" "$LEGACY_STATE_FILE"; do
     [[ -e "$path" ]] && return 0
   done
   return 1
@@ -1324,6 +1404,11 @@ verify_cec() {
   (( service_rc > 0 )) && partial_damage=1
 
   report_service_installed cec-stream-watch.service "$CEC_STREAM_WATCH_SERVICE"
+  service_rc=$?
+  failures=$((failures + service_rc))
+  (( service_rc > 0 )) && partial_damage=1
+
+  report_service_installed cec-startup.service "$CEC_STARTUP_SERVICE"
   service_rc=$?
   failures=$((failures + service_rc))
   (( service_rc > 0 )) && partial_damage=1
@@ -1438,8 +1523,8 @@ verify() {
 
 uninstall_cec_setup() {
   log "Disabling CEC sleep/wake services"
-  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service 2>/dev/null || true
-  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$LEGACY_CEC_HELPER"
+  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service 2>/dev/null || true
+  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$CEC_HELPER" "$CEC_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$LEGACY_CEC_HELPER"
   refresh_managed_layout
   log "Removed CEC sleep/wake configuration installed by this script"
 }
@@ -1454,8 +1539,8 @@ uninstall_bluetooth_setup() {
 
 uninstall_all() {
   log "Disabling installed services"
-  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service bt-wakeup.service 2>/dev/null || true
-  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$BT_WAKE_SERVICE" \
+  systemctl disable --now cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service bt-wakeup.service 2>/dev/null || true
+  rm -f "$CEC_SLEEP_SERVICE" "$CEC_WAKE_SERVICE" "$CEC_STREAM_WATCH_SERVICE" "$CEC_STARTUP_SERVICE" "$BT_WAKE_SERVICE" \
     "$BT_WAKE_RULE" "$MTK_RULE" "$CEC_STATE_FILE" "$BT_STATE_FILE" "$CEC_WAKE_POLICY_FILE" "$STATE_FILE" "$LEGACY_STATE_FILE" \
     "$CEC_HELPER" "$BT_HELPER" "$LEGACY_CEC_HELPER" "$LEGACY_BT_HELPER"
   refresh_managed_layout
@@ -1494,7 +1579,7 @@ SUMMARY
   systemctl daemon-reload
   udevadm control --reload-rules
 
-  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service
+  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service
 
   log "CEC installation complete"
   if ! verify_cec; then
@@ -1614,7 +1699,7 @@ SUMMARY
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=usb --action=add || true
 
-  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service bt-wakeup.service
+  systemctl enable cec-sleep.service cec-wake.service cec-stream-watch.service cec-startup.service bt-wakeup.service
   systemctl restart bt-wakeup.service
 
   log "Installation complete"
